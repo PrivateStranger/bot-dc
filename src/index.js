@@ -1,0 +1,251 @@
+import {
+  Client,
+  GatewayIntentBits,
+  Partials,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+} from 'discord.js';
+import {
+  AudioPlayerStatus,
+  StreamType,
+  VoiceConnectionStatus,
+  createAudioPlayer,
+  createAudioResource,
+  entersState,
+  joinVoiceChannel,
+} from '@discordjs/voice';
+import { Readable } from 'node:stream';
+import * as dotenv from 'dotenv';
+
+dotenv.config();
+
+const token = process.env.BOT_TOKEN;
+if (!token) {
+  console.error('Bot token not set in .env');
+  process.exit(1);
+}
+
+// Stream lofi radio yang stabil dan ramah hosting (direct stream)
+const LOFI_STREAM_URL = 'http://stream.lofi.girl/ls'; 
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMessages,
+  ],
+  partials: [Partials.Channel],
+});
+
+const activeTimers = new Map();
+const activeGuardians = new Map(); // guildId -> { interval, connection }
+const musicSessions = new Map();
+
+client.once('ready', async () => {
+  console.log(`Logged in as ${client.user.tag}`);
+
+  const commands = [
+    new SlashCommandBuilder()
+      .setName('timer')
+      .setDescription('Mulai timer di voice channel')
+      .addIntegerOption(opt =>
+        opt.setName('minutes')
+          .setDescription('Durasi menit')
+          .setRequired(true)
+          .setMinValue(1),
+      )
+      .toJSON(),
+    new SlashCommandBuilder()
+      .setName('stop')
+      .setDescription('Hentikan timer atau penjaga waktu'),
+    new SlashCommandBuilder()
+      .setName('jaga')
+      .setDescription('Bot menjadi penjaga waktu (beep tiap interval)')
+      .addSubcommand(sub =>
+        sub.setName('start')
+          .setDescription('Mulai bunyi beep tiap interval')
+          .addIntegerOption(opt =>
+            opt.setName('minutes')
+              .setDescription('Interval beep dalam menit')
+              .setRequired(true)
+              .setMinValue(1),
+          ),
+      )
+      .addSubcommand(sub =>
+        sub.setName('stop')
+          .setDescription('Hentikan penjaga waktu'),
+      )
+      .toJSON(),
+    new SlashCommandBuilder()
+      .setName('lofi')
+      .setDescription('Putar musik lofi 24/7')
+      .addSubcommand(sub =>
+        sub.setName('start')
+          .setDescription('Mulai musik lofi'),
+      )
+      .addSubcommand(sub =>
+        sub.setName('stop')
+          .setDescription('Hentikan musik lofi'),
+      )
+      .toJSON(),
+  ];
+
+  const rest = new REST({ version: '10' }).setToken(token);
+  const devGuildId = process.env.GUILD_ID?.trim();
+  const route = devGuildId
+    ? Routes.applicationGuildCommands(client.user.id, devGuildId)
+    : Routes.applicationCommands(client.user.id);
+  try {
+    await rest.put(route, { body: commands });
+    console.log('Commands registered');
+  } catch (err) {
+    console.error('Failed to register commands:', err);
+  }
+});
+
+function createBeepResource() {
+  const sampleRate = 48000;
+  const samples = Math.floor(sampleRate * 0.3);
+  const buffer = Buffer.alloc(samples * 4);
+  for (let i = 0; i < samples; i++) {
+    const value = Math.round(Math.sin((2 * Math.PI * 440 * i) / sampleRate) * 0x7fff * 0.6);
+    buffer.writeInt16LE(value, i * 4);
+    buffer.writeInt16LE(value, i * 4 + 2);
+  }
+  return createAudioResource(Readable.from(buffer), { inputType: StreamType.Raw });
+}
+
+client.on('interactionCreate', async interaction => {
+  if (!interaction.isChatInputCommand()) return;
+
+  const { commandName, guildId, user } = interaction;
+  const guild = interaction.guild;
+  if (!guild) return;
+
+  const member = await guild.members.fetch(user.id);
+  const voiceChannel = member.voice.channel;
+
+  if (commandName === 'timer') {
+    if (musicSessions.has(guildId) || activeGuardians.has(guildId)) {
+      return interaction.reply({ content: 'Ada musik atau penjaga waktu yang aktif. Hentikan dulu.', ephemeral: true });
+    }
+    if (!voiceChannel) return interaction.reply({ content: 'Masuk voice channel dulu.', ephemeral: true });
+    if (activeTimers.has(guildId)) return interaction.reply({ content: 'Timer sudah jalan.', ephemeral: true });
+
+    const minutes = interaction.options.getInteger('minutes');
+    const connection = joinVoiceChannel({
+      channelId: voiceChannel.id,
+      guildId: guild.id,
+      adapterCreator: guild.voiceAdapterCreator,
+    });
+
+    const timeout = setTimeout(async () => {
+      const player = createAudioPlayer();
+      connection.subscribe(player);
+      player.play(createBeepResource());
+      await entersState(player, AudioPlayerStatus.Idle, 1000).catch(() => {});
+      connection.destroy();
+      activeTimers.delete(guildId);
+    }, minutes * 60_000);
+
+    activeTimers.set(guildId, { timeout, connection });
+    await interaction.reply(`Timer ${minutes} menit jalan.`);
+  }
+
+  if (commandName === 'stop') {
+    if (activeTimers.has(guildId)) {
+      const t = activeTimers.get(guildId);
+      clearTimeout(t.timeout);
+      t.connection.destroy();
+      activeTimers.delete(guildId);
+    }
+    if (activeGuardians.has(guildId)) {
+      const g = activeGuardians.get(guildId);
+      clearInterval(g.interval);
+      g.connection.destroy();
+      activeGuardians.delete(guildId);
+    }
+    if (musicSessions.has(guildId)) {
+      const s = musicSessions.get(guildId);
+      s.connection.destroy();
+      musicSessions.delete(guildId);
+    }
+    await interaction.reply('Semua aktivitas bot dihentikan.');
+  }
+
+  if (commandName === 'jaga') {
+    const sub = interaction.options.getSubcommand();
+    if (sub === 'start') {
+      if (musicSessions.has(guildId) || activeTimers.has(guildId)) {
+        return interaction.reply({ content: 'Hentikan musik/timer dulu.', ephemeral: true });
+      }
+      if (!voiceChannel) return interaction.reply({ content: 'Masuk voice channel dulu.', ephemeral: true });
+
+      const minutes = interaction.options.getInteger('minutes');
+      const connection = joinVoiceChannel({
+        channelId: voiceChannel.id,
+        guildId: guild.id,
+        adapterCreator: guild.voiceAdapterCreator,
+      });
+
+      const player = createAudioPlayer();
+      connection.subscribe(player);
+
+      const interval = setInterval(async () => {
+        if (connection.state.status === VoiceConnectionStatus.Ready) {
+          player.play(createBeepResource());
+        }
+      }, minutes * 60_000);
+
+      activeGuardians.set(guildId, { interval, connection });
+      await interaction.reply(`Bot sekarang menjaga waktu. Beep setiap ${minutes} menit.`);
+    } else {
+      if (!activeGuardians.has(guildId)) return interaction.reply({ content: 'Penjaga waktu tidak aktif.', ephemeral: true });
+      const g = activeGuardians.get(guildId);
+      clearInterval(g.interval);
+      g.connection.destroy();
+      activeGuardians.delete(guildId);
+      await interaction.reply('Penjaga waktu berhenti.');
+    }
+  }
+
+  if (commandName === 'lofi') {
+    const sub = interaction.options.getSubcommand();
+    if (sub === 'start') {
+      if (activeTimers.has(guildId) || activeGuardians.has(guildId)) {
+        return interaction.reply({ content: 'Hentikan timer/penjaga waktu dulu.', ephemeral: true });
+      }
+      if (!voiceChannel) return interaction.reply({ content: 'Masuk voice channel dulu.', ephemeral: true });
+
+      const connection = joinVoiceChannel({
+        channelId: voiceChannel.id,
+        guildId: guild.id,
+        adapterCreator: guild.voiceAdapterCreator,
+      });
+      const player = createAudioPlayer();
+      connection.subscribe(player);
+
+      const resource = createAudioResource(LOFI_STREAM_URL, { inputType: StreamType.Arbitrary });
+      player.play(resource);
+
+      musicSessions.set(guildId, { connection, player });
+      await interaction.reply('Memutar lofi radio... 🎧');
+    } else {
+      if (!musicSessions.has(guildId)) return interaction.reply({ content: 'Lofi tidak sedang diputar.', ephemeral: true });
+      const s = musicSessions.get(guildId);
+      s.connection.destroy();
+      musicSessions.delete(guildId);
+      await interaction.reply('Musik lofi berhenti.');
+    }
+  }
+});
+
+process.on('SIGINT', () => {
+  for (const t of activeTimers.values()) clearTimeout(t.timeout);
+  for (const g of activeGuardians.values()) clearInterval(g.interval);
+  for (const s of musicSessions.values()) s.connection.destroy();
+  process.exit(0);
+});
+
+client.login(token);
